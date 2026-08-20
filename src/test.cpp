@@ -283,7 +283,7 @@ void testStringCommands(sw::redis::Redis &redis)
         printf("\n");
     }
 
-    // GET 命令与类型错误异常
+    // GET 命令与批量操作命令
     {
         printf("GET 命令\n\n");
         redis.flushdb();
@@ -315,7 +315,7 @@ void testStringCommands(sw::redis::Redis &redis)
 
     // APPEND、GETRANGE 命令
     {
-        printf("APPEND 命令\n\n");
+        printf("APPEND 命令\n\n"); // 返回追加字符串后，整个 value 的长度
         redis.flushdb();
         long long c = redis.append("mykey", "Hello");
         printf("redis < APPEND mykey \"Hello\"\n");
@@ -325,11 +325,15 @@ void testStringCommands(sw::redis::Redis &redis)
         printf("redis > %lld\n", c);
         printf("\n");
 
-        printf("GETRANGE 命令\n\n");
+        printf("SETRANGE 命令\n\n");
+        redis.set("mykey", "This is a string");
+        printf("redis < SETRANGE mykey 0 Redis > %lld\n", redis.setrange("mykey", 0, "Redis"));
+        printf("redis < GET mykey > %s\n", redis.get("mykey").value().c_str());
+
+        printf("GETRANGE 命令\n\n"); // 返回指定范围内的字符串，如果不存在则返回空字符串
         redis.set("mykey", "This is a string");
         printf("redis < GETRANGE mykey 0 3 > %s\n", redis.getrange("mykey", 0, 3).c_str());
         printf("redis < GETRANGE mykey -3 -1 > %s\n", redis.getrange("mykey", -3, -1).c_str());
-        printf("=============================================\n");
     }
 
     // 数值增减命令
@@ -344,24 +348,252 @@ void testStringCommands(sw::redis::Redis &redis)
         printf("redis < INCRBYFLOAT mykey 0.5 > %.2f\n", redis.incrbyfloat("mykey", 0.5));
         printf("=============================================\n");
     }
+}
 
-    // 批量操作命令
+void testListCommands(sw::redis::Redis &redis)
+{
+    printf("List 系列命令:\n");
+    printf("=============================================\n");
+
+    // 左右压入命令
     {
-        printf("MSET / MGET 命令\n\n");
+        printf("LPUSH / RPUSH 命令\n\n");
         redis.flushdb();
-        std::vector<std::pair<std::string, std::string>> kvs = {
-            {"key1", "Hello"}, {"key2", "World"}};
-        redis.mset(kvs.begin(), kvs.end());
-        printf("redis < MSET key1 Hello key2 World\n");
+        redis.lpush("mylist", "world");            // 左压入一个元素
+        redis.lpush("mylist", {"hello", "Redis"}); // 支持一次性压入多个元素
 
-        std::vector<sw::redis::OptionalString> values;
-        redis.mget({"key1", "key2", "nonexisting"}, std::back_inserter(values));
+        std::vector<std::string> elements;
+        redis.lrange("mylist", 0, -1, std::inserter(elements, elements.begin())); // 获取指定下标范围的元素
+        printf("redis < LRANGE mylist 0 -1\n");
         int n = 1;
-        for (auto &val : values)
+        for (auto &e : elements)
         {
-            printf("redis > %d) %s\n", n++, val ? val->c_str() : "(nil)");
+            printf("redis > %d) %s\n", n++, e.c_str());
+        }
+    }
+
+    // 弹出命令
+    {
+        printf("LPOP / RPOP 命令\n\n");
+        redis.flushdb();
+        redis.rpush("mylist", {"one", "two", "three", "four", "five"}); // 先压入五个元素
+
+        auto left = redis.lpop("mylist"); // 删除并返回 List 左侧的第一个元素；List 不存在或为空时返回 std::nullopt
+        printf("redis < LPOP mylist > %s\n", left ? left->c_str() : "(nil)");
+        auto right = redis.rpop("mylist");
+        printf("redis < RPOP mylist > %s\n", right ? right->c_str() : "(nil)");
+        printf("\n");
+    }
+
+    // 阻塞弹出 BLPOP/BRPOP
+    {
+        printf("BLPOP 阻塞弹出命令\n\n");
+        redis.flushdb();
+        redis.rpush("list1", {"a", "b", "c"});
+
+        auto res = redis.blpop({"list1", "list2"}, std::chrono::seconds(0)); // 成功弹出时，返回 {key, value}；超时没有弹出元素时返回 std::nullopt
+        if (res)
+        {
+            printf("redis > 来自键: %s, 值: %s\n", res->first.c_str(), res->second.c_str());
         }
         printf("\n");
+    }
+
+    // 索引与长度
+    {
+        printf("LINDEX / LLEN 命令\n\n");
+        redis.flushdb();
+        redis.rpush("mylist", {"Hello", "World"});
+        printf("redis < LLEN mylist > %lld\n", redis.llen("mylist"));
+
+        auto val = redis.lindex("mylist", 0); // 类似于get，返回指定下标的元素；不存在时返回 std::nullopt
+        printf("redis < LINDEX mylist 0 > %s\n", val ? val->c_str() : "(nil)");
+        printf("=============================================\n");
+    }
+}
+
+void testSetCommands(sw::redis::Redis &redis)
+{
+    printf("Set 系列命令:\n");
+    printf("=============================================\n");
+
+    // 基础增删查
+    {
+        printf("SADD / SMEMBERS / SISMEMBER 命令\n\n");
+        redis.flushdb();
+        redis.sadd("myset", "Hello");
+        redis.sadd("myset", "World");
+        redis.sadd("myset", "World"); // 重复元素自动去重
+
+        std::unordered_set<std::string> elements;
+        redis.smembers("myset", std::inserter(elements, elements.begin()));
+        printf("集合元素数量: %zu\n", elements.size());
+        printf("是否包含 Hello: %d\n", redis.sismember("myset", "Hello"));
+
+        printf("SISMEMBER 和 SPOP 命令\n\n");
+        redis.sadd("myset", {"Hello", "World", "Redis"});
+        // SREM：删除集合中的指定元素
+        printf("SREM 删除 World: %lld\n", redis.srem("myset", "World"));
+        // SPOP：随机删除并返回一个元素
+        auto element = redis.spop("myset");
+        if (element)
+        {
+            printf("SPOP 弹出元素: %s\n", element->c_str());
+        }
+    }
+
+    // 集合运算
+    {
+        printf("交集 / 并集 / 差集 命令\n\n");
+        redis.flushdb();
+        redis.sadd("key1", {"a", "b", "c"});
+        redis.sadd("key2", {"c", "d", "e"});
+
+        std::unordered_set<std::string> inter;
+        redis.sinter({"key1", "key2"}, std::inserter(inter, inter.begin()));
+        printf("交集元素数量: %zu\n", inter.size());
+
+        long long count = redis.sinterstore("key3", {"key1", "key2"});
+
+        std::unordered_set<std::string> union_set;
+        redis.sunion({"key1", "key2"}, std::inserter(union_set, union_set.begin()));
+        printf("并集元素数量: %zu\n", union_set.size());
+
+        std::unordered_set<std::string> diff;
+        redis.sdiff({"key1", "key2"}, std::inserter(diff, diff.begin()));
+        printf("差集元素数量: %zu\n", diff.size());
+    }
+}
+
+void testHashCommand(sw::redis::Redis &redis)
+{
+    printf("Hash 系列命令:\n");
+    printf("=============================================\n");
+
+    // 基础读写
+    {
+        printf("HSET / HGET 命令\n\n");
+        redis.flushdb();
+
+        redis.hset("key", "f1", "111");
+        redis.hset("key", std::make_pair("f2", "222"));
+        // hset 能够一次传入多个 field-value 对!!
+        redis.hset("key", {std::make_pair("f3", "333"),
+                           std::make_pair("f4", "444")});
+        vector<std::pair<string, string>> fields = {
+            std::make_pair("f5", "555"),
+            std::make_pair("f6", "666")};
+        redis.hset("key", fields.begin(), fields.end());
+
+        redis.hset("user", "name", "zhangsan");
+        redis.hset("user", "age", "20");
+
+        auto name = redis.hget("user", "name");
+        auto age = redis.hget("user", "age");
+        if (name && age)
+        {
+            printf("name: %s, age: %s\n", name->c_str(), age->c_str());
+        }
+    }
+
+    // 批量操作
+    {
+        printf("HKEYS / HVALS / HMGET 命令\n\n");
+        redis.flushdb();
+        redis.hset("user", "name", "zhangsan");
+        redis.hset("user", "age", "20");
+
+        // HKEYS：获取 Hash 中所有 field
+        std::vector<string> keys;
+        redis.hkeys("user", std::back_inserter(keys));
+        printf("字段数量: %zu\n", keys.size());
+
+        for (const auto &key : keys)
+        {
+            printf("field: %s\n", key.c_str());
+        }
+
+        // HVALS：获取 Hash 中所有 value
+        std::vector<string> values;
+        redis.hvals("user", std::back_inserter(values));
+
+        printf("值数量: %zu\n", values.size());
+
+        for (const auto &value : values)
+        {
+            printf("value: %s\n", value.c_str());
+        }
+
+        // HMGET：根据多个 field 获取对应的 value
+        std::vector<sw::redis::OptionalString> hmget_values;
+        vector<string> fields = {"name", "age"};
+        redis.hmget("user", fields.begin(), fields.end(), std::back_inserter(hmget_values));
+    }
+
+    // 数值增减
+    {
+        printf("HINCRBY 命令\n\n");
+        redis.flushdb();
+        redis.hset("user", "age", "20");
+        long long new_age = redis.hincrby("user", "age", 2);
+        printf("自增后年龄: %lld\n", new_age);
+        printf("=============================================\n");
+    }
+}
+
+void testZsetCommand(sw::redis::Redis &redis)
+{
+    printf("Zset 系列命令:\n");
+    printf("=============================================\n");
+
+    // 基础增删与范围查询
+    {
+        printf("ZADD / ZRANGE 命令\n\n");
+        redis.flushdb();
+        // 这里其实支持很多插入方式，但是
+        redis.zadd("ranking", "吕布", 100);
+        redis.zadd("ranking", "赵云", 98);
+        redis.zadd("ranking", "典韦", 95);
+
+        vector<std::pair<string, double>> members;
+        redis.zrange("ranking", 0, -1, std::inserter(members, members.begin()));
+        for (auto &item : members)
+        {
+            printf("%s: %.0f\n", item.first.c_str(), item.second);
+        }
+    }
+
+    // 排名与分数查询
+    {
+        printf("ZRANK / ZSCORE / ZREVRANK / ZCARD 命令\n\n");
+
+        auto rank = redis.zrank("ranking", "吕布"); // 某个成员从小到大排第几
+        auto score = redis.zscore("ranking", "吕布");
+
+        printf("吕布的排名(从小到大): %lld, 分数: %.0f\n", rank.value(), score.value());
+
+        rank = redis.zrevrank("ranking", "吕布"); // 某个成员从大到小排第几
+
+        printf("吕布的排名(从大到小): %lld\n", rank.value());
+
+        auto count = redis.zcard("ranking");
+        printf("ranking中的成员数量: %lld\n", count);
+
+        auto result = redis.zrem("ranking", "吕布");
+        printf("删除了 %lld 个成员\n", result);
+    }
+
+    // 交集运算
+    {
+        printf("ZINTERSTORE 命令\n\n");
+        redis.flushdb();
+        redis.zadd("key1", "吕布", 100);
+        redis.zadd("key1", "赵云", 98);
+        redis.zadd("key2", "吕布", 100);
+        redis.zadd("key2", "关羽", 92);
+
+        long long count = redis.zinterstore("result", {"key1", "key2"});
+        printf("交集结果数量: %lld\n", count);
     }
 }
 
@@ -391,5 +623,8 @@ int main()
 
     testGenericCommands(redis);
     testStringCommands(redis);
+    testListCommands(redis);
+    testSetCommands(redis);
+    testHashCommand(redis);
     return 0;
 }
