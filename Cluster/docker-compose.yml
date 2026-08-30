@@ -1,0 +1,166 @@
+version: '3.7'
+networks:
+  mynet:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24 # 创建 mynet 的 Docker 局域网
+services:
+  redis1:
+    # 使用 Redis 5.0.9 镜像
+    image: 'redis:5.0.9'
+    # 给容器指定固定名称，方便 docker exec、docker logs 等操作
+    container_name: redis1
+    # 容器异常退出或 Docker 重启后，自动重新启动
+    restart: always
+    # 挂载配置文件目录
+    # 宿主机 ./redis1/  →  容器 /etc/redis/
+    volumes:
+      - ./redis1/:/etc/redis/
+
+    # 端口映射
+    # 宿主机端口 : 容器端口
+    ports:
+      # Redis 客户端访问端口
+      # 宿主机 6371 → redis1 容器的 6379
+      - 6371:6379
+      # Redis Cluster Bus 集群内部通信端口
+      # 宿主机 16371 → redis1 容器的 16379
+      - 16371:16379
+    # 启动 Redis，并指定使用 redis.conf 配置文件
+    command: redis-server /etc/redis/redis.conf
+
+    # 将 redis1 加入 mynet Docker 网络
+    networks:
+      mynet:
+        # 给 redis1 指定固定的 Docker 内网 IP
+        ipv4_address: 172.30.0.101
+  redis2:
+    image: 'redis:5.0.9'
+    container_name: redis2
+    restart: always
+    volumes:
+      - ./redis2/:/etc/redis/
+    ports:
+      - 6372:6379
+      - 16372:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.102
+  redis3:
+    image: 'redis:5.0.9'
+    container_name: redis3
+    restart: always
+    volumes:
+      - ./redis3/:/etc/redis/
+    ports:
+      - 6373:6379
+      - 16373:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.103
+  redis4:
+    image: 'redis:5.0.9'
+    container_name: redis4
+    restart: always
+    volumes:
+      - ./redis4/:/etc/redis/
+    ports:
+      - 6374:6379
+      - 16374:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.104
+  redis5:
+    image: 'redis:5.0.9'
+    container_name: redis5
+    restart: always
+    volumes:
+      - ./redis5/:/etc/redis/
+    ports:
+      - 6375:6379
+      - 16375:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.105
+  redis6:
+    image: 'redis:5.0.9'
+    container_name: redis6
+    restart: always
+    volumes:
+      - ./redis6/:/etc/redis/
+    ports:
+      - 6376:6379
+      - 16376:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.106
+  redis7:
+    image: 'redis:5.0.9'
+    container_name: redis7
+    restart: always
+    volumes:
+      - ./redis7/:/etc/redis/
+    ports:
+      - 6377:6379
+      - 16377:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.107
+  redis8:
+    image: 'redis:5.0.9'
+    container_name: redis8
+    restart: always
+    volumes:
+      - ./redis8/:/etc/redis/
+    ports:
+      - 6378:6379
+      - 16378:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.108
+  redis9:
+    image: 'redis:5.0.9'
+    container_name: redis9
+    restart: always
+    volumes:
+      - ./redis9/:/etc/redis/
+    ports:
+      - 6379:6379
+      - 16379:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.109
+  redis10:
+    image: 'redis:5.0.9'
+    container_name: redis10
+    restart: always
+    volumes:
+      - ./redis10/:/etc/redis/
+    ports:
+      - 6380:6379
+      - 16380:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.110
+  redis11:
+    image: 'redis:5.0.9'
+    container_name: redis11
+    restart: always
+    volumes:
+      - ./redis11/:/etc/redis/
+    ports:
+      - 6381:6379
+      - 16381:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.111

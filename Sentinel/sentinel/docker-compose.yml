@@ -1,0 +1,42 @@
+version: '3.7'
+
+services:
+
+  # Sentinel 节点 1
+  sentinel1:
+    image: 'redis:5.0.9'                              # 使用 Redis 5.0.9 镜像
+    container_name: redis-sentinel-1                  # 容器名称
+    restart: always                                   # 容器退出后自动重启
+    command: redis-sentinel /etc/redis/sentinel.conf  # 启动 Sentinel，并加载配置文件
+    volumes:
+      - ./sentinel1.conf:/etc/redis/sentinel.conf    # 将宿主机 Sentinel 配置文件挂载到容器
+    ports:
+      - 26379:26379                                  # 宿主机 26379 → 容器 26379
+
+  # Sentinel 节点 2
+  sentinel2:
+    image: 'redis:5.0.9'
+    container_name: redis-sentinel-2
+    restart: always
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./sentinel2.conf:/etc/redis/sentinel.conf    # 使用 Sentinel 2 的配置文件
+    ports:
+      - 26380:26379                                  # 宿主机 26380 → 容器 26379
+
+  # Sentinel 节点 3
+  sentinel3:
+    image: 'redis:5.0.9'
+    container_name: redis-sentinel-3
+    restart: always
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./sentinel3.conf:/etc/redis/sentinel.conf    # 使用 Sentinel 3 的配置文件
+    ports:
+      - 26381:26379                                  # 宿主机 26381 → 容器 26379
+
+# 使用创建项目时自动创建的专属网络，让 Sentinel 能与 Redis 主从节点通信
+networks:
+  default:
+    external:
+      name: sentinel_default

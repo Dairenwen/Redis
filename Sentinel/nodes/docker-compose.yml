@@ -1,0 +1,32 @@
+version: '3.7'
+
+services:
+
+  # Redis 主节点
+  master:
+    image: 'redis:5.0.9'                 # 使用 Redis 5.0.9 镜像
+    container_name: redis-master         # 容器名称
+    restart: always                      # 容器退出后自动重启
+    command: redis-server --appendonly yes  # 启动 Redis，并开启 AOF 持久化
+    ports:
+      - 6379:6379                        # 宿主机 6379 → 容器 6379
+
+  # Redis 从节点 1
+  slave1:
+    image: 'redis:5.0.9'
+    container_name: redis-slave1
+    restart: always
+    command: redis-server --appendonly yes --slaveof redis-master 6379
+    # --slaveof redis-master 6379：指定 redis-master:6379 为主节点，建立主从复制
+    ports:
+      - 6380:6379                        # 宿主机 6380 → 容器 6379
+
+  # Redis 从节点 2
+  slave2:
+    image: 'redis:5.0.9'
+    container_name: redis-slave2
+    restart: always
+    command: redis-server --appendonly yes --slaveof redis-master 6379
+    # 同样从 redis-master:6379 同步数据
+    ports:
+      - 6381:6379                        # 宿主机 6381 → 容器 6379
