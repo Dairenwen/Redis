@@ -1856,3 +1856,2061 @@ flowchart TD
   这样虽然文件名相同，但实际路径不同，不会冲突。
 
 
+# 哨兵
+
+
+Redis 从 2.8 开始提供了 Redis Sentinel（哨兵）**用于监控 Redis 主从节点，当主节点故障时，自动选择一个从节点提升为新的主节点，实现自动故障转移。**
+
+
+**注意一般分为两种情况：**
+
+* **从节点主动断开与主节点的连接**：Sentinel 一般**不会**因此把这个从节点提升为主节点，因为这是**从节点自身下线**，主节点并没有发生故障；Sentinel 的故障转移主要针对**主节点故障**。
+
+* **主节点真正挂掉**：Sentinel 检测到主节点客观下线后，会选择一个健康的从节点，将它**提升为新的主节点**，这就是自动故障转移。
+
+
+
+## 概念
+
+
+| 名词 | 逻辑结构 | 物理结构 |
+| --- | --- | --- |
+| 主节点 | Redis 主服务 | 一个独立的 redis-server 进程 |
+| 从节点 | Redis 从服务 | 一个独立的 redis-server 进程 |
+| Redis 数据节点 | 主从节点 | 主节点和从节点的进程 |
+| 哨兵节点 | 监控 Redis 数据节点的节点 | 一个独立的 redis-sentinel 进程 |
+| 哨兵节点集合 | 若干哨兵节点的抽象组合 | 若干 redis-sentinel 进程 |
+| Redis 哨兵（Sentinel） | Redis 提供的高可用方案 | 哨兵节点集合 + Redis 主从节点 |
+| 应用方 | 泛指一个或多个客户端 | 一个或多个连接 Redis 的进程 |
+
+
+
+### 主从复制的问题
+
+主从复制可以实现**数据备份和读写分离**，但仍存在两个问题：
+
+1. **高可用问题**：主节点宕机后，需要人工切换从节点，故障恢复慢。→ **Redis Sentinel 解决**
+2. **扩展性问题**：只能分担读压力，写压力和存储压力仍受单机限制。→ **Redis Cluster 解决**
+
+本章主要介绍 **Redis Sentinel 如何解决主节点故障后的高可用问题**。
+
+
+### 人工恢复主节点故障
+
+在主从复制模式下，主节点故障后的人工恢复流程非常繁琐，整体过程如下：
+
+#### 阶段1：正常运行的主从架构
+
+```mermaid
+graph TD
+    subgraph 主从集群
+        Master[Master]
+        Slave1[Slave 1]
+        Slave2[Slave 2]
+        Master -->|主从同步| Slave1
+        Master -->|主从同步| Slave2
+    end
+    subgraph 客户端
+        C1[Client 1]
+        C2[Client 2]
+        C3[Client 3]
+        C4[Client 4]
+    end
+    C1 & C2 & C3 & C4 -->|读写命令| Master
+```
+
+#### 阶段2：主节点宕机，人工发现
+
+```mermaid
+graph TD
+    subgraph 主从集群
+        Master[Master<br/>宕机]:::fault
+        Slave1[Slave 1]
+        Slave2[Slave 2]
+        Master -->|主从同步| Slave1
+        Master -->|主从同步| Slave2
+    end
+
+    subgraph 客户端
+        C1[Client 1]
+        C2[Client 2]
+        C3[Client 3]
+        C4[Client 4]
+    end
+
+    Monitor[用户监控发现主节点宕机]
+    Monitor -.-> Master
+    C1 & C2 & C3 & C4 -->|读写命令| Master
+
+    classDef fault fill:red,color:white
+```
+
+#### 阶段3：人工选定新主节点
+
+```mermaid
+graph TD
+    Slave1[Slave 1]
+    Slave2[Slave 2]
+    User[用户在从节点集群中选择<br/>一个作为新的主节点]
+    User -.-> Slave1
+```
+
+#### 阶段4：调整从节点同步关系
+
+```mermaid
+graph TD
+    subgraph 新主从集群
+        NewMaster[原 Slave 1<br/>新 Master]
+        Slave2[Slave 2]
+        NewMaster -->|主从同步| Slave2
+        Note[配置从节点同步新的主节点]
+        Note -.-> Slave2
+    end
+```
+
+#### 阶段5：客户端切换到新主节点
+
+```mermaid
+graph TD
+    subgraph 新主从集群
+        NewMaster[原 Slave 1<br/>新 Master]
+        Slave2[Slave 2]
+        NewMaster -->|主从同步| Slave2
+    end
+    subgraph 客户端
+        C1[Client 1]
+        C2[Client 2]
+        C3[Client 3]
+        C4[Client 4]
+    end
+    Tip[让应用连接新主节点]
+    Tip -.-> C1 & C2 & C3 & C4
+    C1 & C2 & C3 & C4 -->|读写命令| NewMaster
+```
+
+#### 阶段6：原主节点恢复，降级为从节点
+
+```mermaid
+graph TD
+    subgraph 恢复后主从集群
+        NewMaster[原 Slave 1<br/>新 Master]
+        Slave2[Slave 2]
+        OldMaster[原 Master<br/>新 Slave 3]
+        NewMaster -->|主从同步| Slave2
+        NewMaster -->|主从同步| OldMaster
+        Note[原主节点恢复后<br/>配置其成为一个从节点]
+        Note -.-> OldMaster
+    end
+    subgraph 客户端
+        C1[Client 1]
+        C2[Client 2]
+        C3[Client 3]
+        C4[Client 4]
+    end
+    C1 & C2 & C3 & C4 -->|读写命令| NewMaster
+```
+
+
+1. 运维人员通过监控系统，发现 Redis 主节点故障。
+2. 运维人员选定一个从节点（此处选择 slave 1），执行 `slaveof no one`，使其成为新的主节点。
+3. 运维人员让剩余从节点（此处为 slave2）执行 `slaveof {newMasterIp} {newMasterPort}`，从新主节点开始数据同步。
+4. 更新应用方连接的主节点信息为新主节点的地址和端口。
+5. 如果原主节点恢复，执行 `slaveof {newMasterIp} {newMasterPort}`，让其成为新主的一个从节点。
+
+
+这个流程的主要缺点就是：**全靠人工处理，故障恢复慢，而且容易出错。**
+
+具体来说：
+
+1. **故障发现依赖人工**
+
+   * 需要运维人员先发现主节点故障，无法自动处理。
+
+2. **主从切换依赖人工**
+
+   * 需要人工选择新的 Master，并执行 `slaveof no one`。
+
+3. **其他从节点需要手动重新配置**
+
+   * 每个从节点都要重新指向新的 Master，操作繁琐。
+
+4. **客户端也要手动修改**
+
+   * 应用需要更新新的 Master 地址，否则仍然连接旧 Master。
+
+5. **容易出现操作错误**
+
+   * 主节点选择、配置修改、客户端切换等环节都可能出错。
+
+6. **恢复时间不可控**
+
+   * 从发现故障到完成切换，整个过程取决于运维人员的响应速度。
+
+
+
+
+
+
+### 哨兵自动恢复主节点故障
+
+当主节点出现故障时，Redis Sentinel 能自动完成故障发现和故障转移，并通知应用方，从而实现真正的高可用。
+
+**Redis Sentinel 是一个分布式架构，包含若干个 Sentinel 节点和 Redis 数据节点**。每个 Sentinel 节点会对**数据节点和其余 Sentinel 节点**进行监控，当它发现节点不可达时，会标记节点下线。**如果下线的是主节点，它还会和其他 Sentinel 节点协商**，当大多数 Sentinel 节点对“主节点不可达”**达成共识后，会在内部选举出一个领导节点**来完成自动故障转移，同时将变化实时通知给应用方。**整个过程完全自动，不需要人工介入。**
+
+
+
+### Redis Sentinel 架构
+
+```mermaid
+graph TD
+    subgraph 哨兵节点集合
+        S1[sentinel 1]
+        S2[sentinel 2]
+        S3[sentinel 3]
+        S1 <--> S2 <--> S3
+    end
+
+    subgraph 数据节点集合
+        Master[master]
+        Slave1[slave]
+        Slave2[slave]
+        Master -->|主从同步| Slave1
+        Master -->|主从同步| Slave2
+    end
+
+    S1 & S2 & S3 -->|监控| Master
+    S1 & S2 & S3 -->|监控| Slave1
+    S1 & S2 & S3 -->|监控| Slave2
+```
+
+Redis Sentinel 相比主从复制模式，多了若干（建议保持奇数）Sentinel 节点用于监控数据节点，哨兵节点会定期监控所有节点（包含数据节点和其他哨兵节点）。针对主节点故障的情况，故障转移流程大致如下：
+
+1. 主节点故障，从节点同步连接中断，主从复制停止。
+2. 哨兵节点通过定期监控发现主节点故障，与其他哨兵节点协商，达成“主节点故障”的多数共识。这一步主要防止误判：出问题的不是主节点，而是发现故障的哨兵节点本身（常见于哨兵网络被孤立的场景）。
+3. 哨兵节点之间使用 Raft 算法选举出一个领导角色，由该节点负责后续的故障转移工作。
+4. 哨兵领导者执行故障转移：从节点中选择一个作为新主节点；让其他从节点同步新主节点；通知应用层切换到新主节点。
+
+#### 故障转移时间线
+
+```mermaid
+timeline
+    title Redis Sentinel 故障转移时间线
+
+    主节点宕机
+        : Sentinel 首次发现主节点故障
+
+    故障确认
+        : 多个 Sentinel 达成共识
+
+    领导选举
+        : 选举出 Sentinel 领导节点
+
+    故障转移
+        : 领导节点开始执行故障转移
+
+    切换完成
+        : 从节点晋升为新的主节点
+```
+
+Redis Sentinel 具有以下几个核心功能：
+
+- **监控**：Sentinel 节点会定期检测 Redis 数据节点、其余哨兵节点是否可达。
+- **故障转移**：实现从节点晋升为主节点，并维护后续正确的主从关系。
+- **通知**：Sentinel 节点会将故障转移的结果通知给应用方。
+
+
+
+### 安装部署 (基于 docker)
+
+#### 准备工作
+
+1. **安装 docker 和 docker-compose**
+
+Docker-compose 安装命令：
+
+```
+# ubuntu
+apt install docker-compose
+
+# centos
+yum install docker-compose
+```
+
+2. **停止之前的 redis-server**
+
+```
+# 停止 redis-server
+service redis-server stop
+
+# 停止 redis-sentinel（如果已有运行）
+service redis-sentinel stop
+```
+
+3. **使用 docker 获取 redis 镜像**
+
+```
+docker pull redis:5.0.9
+```
+
+#### 编排 redis 主从节点
+
+1. **编写 docker-compose.yml**
+
+创建 `/root/redis/docker-compose.yml`:
+
+
+
+```yaml
+version: '3.7'
+services:
+  master:
+    image: 'redis:5.0.9'
+    container_name: redis-master
+    restart: always
+    command: redis-server --appendonly yes
+    ports:
+      - 6379:6379
+
+  slave1:
+    image: 'redis:5.0.9'
+    container_name: redis-slave1
+    restart: always
+    command: redis-server --appendonly yes --slaveof redis-master 6379
+    ports:
+      - 6380:6379
+
+  slave2:
+    image: 'redis:5.0.9'
+    container_name: redis-slave2
+    restart: always
+    command: redis-server --appendonly yes --slaveof redis-master 6379
+    ports:
+      - 6381:6379
+```
+
+
+2. **启动所有容器**
+
+```
+docker-compose up -d
+```
+
+如果启动后发现配置有误，需要重新操作，使用 `docker-compose down` 停止并删除刚才创建的容器。
+
+3. **查看运行日志**
+
+```
+docker-compose logs
+```
+
+4. **验证**
+
+连接主节点：
+
+```
+redis-cli -p 6379
+```
+
+执行 `info replication` 输出示例：
+
+```
+127.0.0.1:6379> info replication
+# Replication
+role:master
+connected_slaves:2
+slave0:ip=172.18.0.2,port=6379,state=online,offset=294,lag=0
+slave1:ip=172.18.0.3,port=6379,state=online,offset=294,lag=0
+master_replid:ba86e6d49696a7c2ee38ec89487764f0f362bb1d
+master_replid2:0000000000000000000000000000000000000000
+master_repl_offset:294
+second_repl_offset:-1
+repl_backlog_active:1
+repl_backlog_size:1048576
+repl_backlog_first_byte_offset:1
+repl_backlog_histlen:294
+127.0.0.1:6379>
+```
+
+连接从节点：
+
+```
+redis-cli -p 6380
+```
+
+执行 `info replication` 输出示例：
+
+```
+127.0.0.1:6379> info replication
+# Replication
+role:slave
+master_host:redis-master
+master_port:6379
+master_link_status:up
+master_last_io_seconds_ago:9
+master_sync_in_progress:0
+slave_repl_offset:1456
+slave_priority:100
+slave_read_only:1
+connected_slaves:0
+master_replid:ba86e6d49696a7c2ee38ec89487764f0f362bb1d
+master_replid2:0000000000000000000000000000000000000000
+master_repl_offset:1456
+second_repl_offset:-1
+repl_backlog_active:1
+repl_backlog_size:1048576
+repl_backlog_first_byte_offset:1
+repl_backlog_histlen:1456
+```
+
+
+
+#### 编排 redis-sentinel 节点
+
+也可以把 redis-sentinel 和 redis 主从放在同一个 yml 中编排，主播这里就分成两组主要有两个原因：
+
+- 观察日志更方便
+- 确保 Redis 主从节点启动之后再启动 redis-sentinel。
+
+1. **编写 docker-compose.yml**
+
+创建 `/root/redis-sentinel/docker-compose.yml`
+
+
+```yaml
+version: '3.7'
+
+services:
+
+  # Sentinel 节点 1
+  sentinel1:
+    image: 'redis:5.0.9'                              # 使用 Redis 5.0.9 镜像
+    container_name: redis-sentinel-1                  # 容器名称
+    restart: always                                   # 容器退出后自动重启
+    command: redis-sentinel /etc/redis/sentinel.conf  # 启动 Sentinel，并加载配置文件
+    volumes:
+      - ./sentinel1.conf:/etc/redis/sentinel.conf    # 将宿主机 Sentinel 配置文件挂载到容器
+    ports:
+      - 26379:26379                                  # 宿主机 26379 → 容器 26379
+
+  # Sentinel 节点 2
+  sentinel2:
+    image: 'redis:5.0.9'
+    container_name: redis-sentinel-2
+    restart: always
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./sentinel2.conf:/etc/redis/sentinel.conf    # 使用 Sentinel 2 的配置文件
+    ports:
+      - 26380:26379                                  # 宿主机 26380 → 容器 26379
+
+  # Sentinel 节点 3
+  sentinel3:
+    image: 'redis:5.0.9'
+    container_name: redis-sentinel-3
+    restart: always
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./sentinel3.conf:/etc/redis/sentinel.conf    # 使用 Sentinel 3 的配置文件
+    ports:
+      - 26381:26379                                  # 宿主机 26381 → 容器 26379
+
+# 使用已经存在的 Docker 网络，让 Sentinel 能与 Redis 主从节点通信
+networks:
+  default:
+    external:
+      name: redis-data_default
+```
+
+
+
+2. **创建配置文件**
+
+创建 `sentinel1.conf`、`sentinel2.conf`、`sentinel3.conf` 三份文件，初始内容完全相同，都放到 `/root/redis-sentinel/` 目录中。
+
+```
+bind 0.0.0.0                         # 监听所有网卡，允许其他容器连接 Sentinel
+port 26379                           # Sentinel 监听端口
+
+sentinel monitor redis-master redis-master 6379 2
+# 监控名为 redis-master 的主节点
+# redis-master：主节点地址
+# 6379：主节点端口
+# 2：至少 2 个 Sentinel 同意主节点下线，才认为主节点客观下线
+
+sentinel down-after-milliseconds redis-master 1000
+# 1 秒内无法与主节点正常通信，则认为主节点主观下线
+```
+
+#### 理解 sentinel monitor
+
+格式：
+
+```
+sentinel monitor 主节点名 主节点ip 主节点端口 法定票数
+```
+
+- **主节点名**：哨兵内部自定义的主节点标识名称。
+- **主节点ip**：部署 redis-master 的设备 IP。此处使用 docker，可以直接写容器名，会被自动 DNS 解析为对应容器 IP。
+- **主节点端口**：主节点 Redis 服务端口。
+- **法定票数**：判定主节点下线的同意票数阈值。单个哨兵可能因为自身网络问题误判主节点下线，通过多哨兵投票可以避免误判；当认为主节点下线的哨兵数 ≥ 法定票数时，才会真正判定主节点下线。
+
+#### 理解 sentinel down-after-milliseconds
+
+主节点和哨兵之间通过心跳包通信，如果心跳包在指定时间内没有返回，就视为节点出现故障。
+
+
+3. **启动所有容器**
+
+```
+docker-compose up -d
+```
+
+如果启动后发现配置有误，需要重新操作，使用 `docker-compose down` 即可停止并删除刚才创建的容器。
+
+4. **查看运行日志**
+
+```
+docker-compose logs
+```
+
+
+启动后可以看到，哨兵节点已经通过主节点，自动发现了对应的从节点。
+日志示例：
+
+```
+1:X 27 Aug 2026 16:01:16.205 # oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+1:X 27 Aug 2026 16:01:16.205 # Redis version=5.0.9, bits=64, commit=00000000, modified=0, pid=1, just started
+1:X 27 Aug 2026 16:01:16.205 # Configuration loaded
+1:X 27 Aug 2026 16:01:16.205 * Running mode=sentinel, port=26379.
+1:X 27 Aug 2026 16:01:16.207 # Sentinel ID is c8bdb10b8999ffdc6a5d84fede44f287b2557494
+1:X 27 Aug 2026 16:01:16.207 # +monitor master redis-master 172.18.0.4 6379 quorum 2
+1:X 27 Aug 2026 16:01:16.208 * +slave slave 172.18.0.2:6379 172.18.0.2 6379 @ redis-master 172.18.0.4 6379
+1:X 27 Aug 2026 16:01:16.209 * +slave slave 172.18.0.3:6379 172.18.0.3 6379 @ redis-master 172.18.0.4 6379
+1:X 27 Aug 2026 16:01:18.255 * +sentinel sentinel 7fcaa173a0685008dd9129973099c286bfe3a09d 172.18.0.7 26379 @ redis-master 172.18.0.4 6379
+```
+
+
+
+
+### 重新选举
+
+#### redis-master 宕机之后
+
+手动把 `redis-master` 停止：
+
+```
+docker stop redis-master
+```
+
+#### 观察哨兵日志
+
+可以看到哨兵先检测到主节点主观下线（sdown），进一步由于主节点故障得票达到法定阈值，master 最终被判定为客观下线（odown）。
+
+- **主观下线 (Subjectively Down, SDown)**：单个哨兵感知到主节点心跳异常，单方面判定为主观下线。
+- **客观下线 (Objectively Down, ODown)**：多个哨兵达成一致意见，共同确认 master 确实下线。
+
+随后哨兵集群会挑选出一个新的 master，关键日志示例：
+
+```
++switch-master redis-master 172.22.0.2 6379 172.22.0.4 6379
+```
+
+整个切换过程对业务无感知，Redis 服务仍然可以正常使用。
+
+### redis-master 重启之后
+
+手动把 `redis-master` 重新启动：
+
+```
+docker start redis-master
+```
+
+#### 观察哨兵日志
+
+可以看到重启后的原主节点会被自动降级为从节点：
+
+```
++convert-to-slave slave 172.22.0.2:6379 172.22.0.2 6379 @ redis-master 172.22.0.4 6379
+```
+
+使用 redis-cli 可以验证节点角色变化：
+
+```
+127.0.0.1:6379> info replication
+# Replication
+role:slave
+master_host:172.22.0.4
+master_port:6379
+master_link_status:up
+master_last_io_seconds_ago:0
+master_sync_in_progress:0
+slave_repl_offset:324475
+slave_priority:100
+slave_read_only:1
+connected_slaves:0
+master_replid:e6ecc285a2892fba157318c77ebe1409f9c2254e
+master_replid2:0000000000000000000000000000000000000000
+master_repl_offset:324475
+second_repl_offset:-1
+repl_backlog_active:1
+repl_backlog_size:1048576
+repl_backlog_first_byte_offset:318295
+repl_backlog_histlen:6181
+```
+
+
+
+- Redis 主节点宕机后，**哨兵会自动从从节点中提拔一个节点成为新的主节点。**
+- 原主节点重启恢复后，**会被哨兵纳入监控，但只会作为新主节点的从节点使用。**
+
+
+
+### 选举原理
+
+假定当前环境：3 个哨兵节点（sentinel1、sentinel2、sentinel3），1 个主节点（redis-master），2 个从节点（redis-slave1、redis-slave2）。
+当主节点出现故障时，会触发完整的重新选举流程。
+
+#### 哨兵整体架构
+
+```mermaid
+graph TD
+    subgraph 哨兵节点集合
+        S1[sentinel 1]
+        S2[sentinel 2]
+        S3[sentinel 3]
+        S1 <--> S2 <--> S3
+    end
+
+    subgraph 数据节点集合
+        Master[master]
+        Slave1[slave]
+        Slave2[slave]
+        Master -->|主从同步| Slave1
+        Master -->|主从同步| Slave2
+    end
+
+    S1 & S2 & S3 -->|监控| Master
+    S1 & S2 & S3 -->|监控| Slave1
+    S1 & S2 & S3 -->|监控| Slave2
+```
+
+#### 故障转移完整流程
+
+```mermaid
+flowchart TD
+    A[主节点宕机] --> B[单个哨兵检测到心跳中断<br/>判定主观下线 SDown]
+    B --> C[多个哨兵互相通信、投票]
+    C --> D{票数 >= 法定票数?}
+    D -- 否 --> F[维持现状，继续监控]
+    D -- 是 --> E[判定客观下线 ODown]
+    E --> G[哨兵集群 Raft 选举 leader]
+    G --> H[leader 按规则挑选新主节点]
+    H --> I[提升选中从节点为新 master]
+    I --> J[其余从节点切换同步新 master]
+    J --> K[通知客户端新主节点地址]
+    K --> L[故障转移完成]
+```
+
+##### 1) 主观下线
+
+当 redis-master 宕机时，它与三个哨兵之间的心跳连接会断开。redis-master 出现严重故障，三个哨兵都会独立将 redis-master 判定为**主观下线 (SDown)**。
+
+##### 2) 客观下线
+
+判定主观下线后，sentinel1、sentinel2、sentinel3 会互相通信，对主节点故障这件事进行投票。当故障确认票数 >= 配置的法定票数之后，就会触发客观下线。
+
+法定票数在哨兵配置中定义：
+
+```
+sentinel monitor redis-master 172.22.0.4 6379 2
+```
+
+这里配置的 `2` 就是法定票数。
+当多数哨兵确认主节点故障，就意味着 redis-master 故障被正式确认，此时触发**客观下线 (ODown)**。
+
+##### 3) 选举出哨兵的 leader
+
+接下来需要从哨兵集群中选出一个领导节点（leader），由它全权负责后续的从节点升级、主从关系调整等故障转移工作。选举过程基于 **Raft 算法** 实现。
+
+可以，这里其实不用把 Raft 的细节讲得这么复杂。你只需要抓住 **“选一个 leader 出来负责故障转移”**。
+
+##### Raft 选举过程
+
+假设有 3 个 Sentinel：S1、S2、S3。
+
+1. **Sentinel 之间互相投票**，每个节点只能投一票。
+2. **获得多数票（至少 2 票）的 Sentinel 成为 Leader**。
+3. **Leader 负责执行故障转移**，选择一个 Slave 晋升为新的 Master。
+4. 选举完成。
+
+不是随机选 Leader，而是按照“先收到谁的拉票请求，就优先给谁投票”的规则进行竞争，因此最终结果可能受网络延迟、消息到达顺序影响
+
+
+
+
+
+
+##### 4) leader 挑选合适的 slave 成为新 master
+
+leader 按照以下优先级规则挑选新主节点：
+
+
+
+
+1. **先排除不合格节点**：与主节点断开时间过长的从节点，不参与选举。
+2. **优先级优先**：比较 `slave-priority`/ `replica-priority`，**数值越小优先级越高**；`0` 表示永远不会被提升为主节点。
+3. **复制偏移量优先**：优先级相同时，比较 `replication offset`，**偏移量越大，说明从主节点处理的数据越多，越优先**。
+4. **运行 ID 最后比较**：前两项都相同时，比较 `run ID` 的**字典序（lexicographical）**，**字典序更小的优先**。这主要是为了让选择结果确定，而不是因为“小 ID 本身更优秀”。
+
+
+
+
+
+当某个 slave 被指定为新 master 之后：
+
+1. leader 向该节点发送命令，执行 `slave no one`，正式升级为主节点；
+2. leader 通知剩余所有从节点，切换同步到这个新的主节点。
+
+
+### 注意事项
+
+- 哨兵节点不能只有一个，否则哨兵节点自身故障会影响整个系统的可用性。
+- 哨兵节点数量最好为奇数，方便 leader 选举，得票更容易超过半数。
+- 哨兵只负责故障转移，数据存储仍然由 Redis 主从节点负责。
+- 哨兵 + 主从复制解决了存储高可用问题，但无法解决单机存储容量不足的问题，当数据量超过单机上限时，这种架构就难以胜任。
+
+
+# 集群
+
+## 概念
+
+* **哨兵模式**解决的是 **Master 故障后的自动故障转移**，但数据仍然由**单组 Master / Slave** 存储，受单机内存限制。
+* 当数据量超过单机内存时，需要进行**横向扩容**。
+* **Redis Cluster** 将数据划分成多个**分片（多组 Master / Slave）**，每组只存储部分数据，所有分片共同组成完整的数据集。
+* 例如：**1TB 数据 → 3 组分片 → 每组约存储 1/3 数据**。
+
+
+
+
+### Redis 集群架构
+```mermaid
+graph TB
+    subgraph 全量数据集
+        AllData[全部业务数据]
+    end
+
+    subgraph 分片 0
+        M1[Master 1]
+        S11[Slave 1-1]
+        S12[Slave 1-2]
+        M1 -->|主从同步| S11
+        M1 -->|主从同步| S12
+    end
+
+    subgraph 分片 1
+        M2[Master 2]
+        S21[Slave 2-1]
+        S22[Slave 2-2]
+        M2 -->|主从同步| S21
+        M2 -->|主从同步| S22
+    end
+
+    subgraph 分片 2
+        M3[Master 3]
+        S31[Slave 3-1]
+        S32[Slave 3-2]
+        M3 -->|主从同步| S31
+        M3 -->|主从同步| S32
+    end
+
+    AllData -->|1/3 数据| M1
+    AllData -->|1/3 数据| M2
+    AllData -->|1/3 数据| M3
+```
+
+架构说明：
+- Master1 和 Slave11、Slave12 存储相同数据，占总数据的 1/3
+- Master2 和 Slave21、Slave22 存储相同数据，占总数据的 1/3
+- Master3 和 Slave31、Slave32 存储相同数据，占总数据的 1/3
+- 三组分片存储的数据各不相同，共同组成完整数据集
+- 每个 Slave 都是对应 Master 的备份，Master 宕机后对应的 Slave 会自动补位成 Master
+- 每一组主从结构都称为一个**分片（Sharding）**
+- 全量数据增长时，只需要增加更多分片即可完成扩容
+
+
+
+## 数据分片算法
+
+
+### 1) 哈希求余
+
+#### 原理
+设有 N 个分片，使用 `[0, N-1]` 进行编号。对给定的 key 计算 hash 值，再将结果对 N 取余，得到的结果就是该 key 所属的分片编号。
+
+**示例**：N = 3，key 为 `hello`，对 key 计算 md5 哈希值得到 `bc4b2a76b9719d91`，将结果对 3 取余为 0，那么 `hello` 这个 key 就存放到 0 号分片。
+
+```mermaid
+flowchart LR
+    A[输入 key] --> B[计算 hash 值]
+    B --> C[hash 值 % 分片总数 N]
+    C --> D[得到分片编号]
+    D --> E[路由到对应分片]
+```
+
+#### 优缺点
+- **优点**：算法简单高效，数据分配均匀。
+- **缺点**：扩容时 N 发生变化，原有的映射规则几乎全部失效，需要在节点间大量迁移数据，扩容开销非常大。
+
+
+
+
+### 2) 一致性哈希算法
+
+为了降低扩容时的数据迁移开销，业界提出了一致性哈希算法。
+
+#### 原理
+1. **构建哈希环**：将 `0 ~ 2^32-1` 的整数空间映射成一个首尾相连的圆环，数据按顺时针方向增长。
+2. **分片落位**：将 N 个分片分别映射到圆环的某个固定位置上。
+3. **key 路由**：对 key 计算 hash 得到值 H，从 H 在圆环上的位置**顺时针向下查找**，遇到的第一个分片，就是该 key 所属的分片。
+
+相当于 N 个分片把整个圆环分成了 N 个管辖区间，key 的 hash 值落在哪个区间，就归对应区间的分片管理。
+
+```mermaid
+graph TD
+    subgraph HashRing["一致性哈希环（3个分片）"]
+        P0["0号分片"]
+        P1["1号分片"]
+        P2["2号分片"]
+
+        P0 -->|"顺时针管辖"| P1
+        P1 -->|"顺时针管辖"| P2
+        P2 -->|"顺时针管辖"| P0
+    end
+
+    K1["key1"] -->|"顺时针查找"| P1
+    K2["key2"] -->|"顺时针查找"| P2
+    K3["key3"] -->|"顺时针查找"| P0
+```
+
+#### 扩容特性
+如果新增一个分片，只需要把前一个分片的部分区间数据迁移到新分片上，其余分片的管辖区间完全不受影响。
+
+比如 3 分片扩容为 4 分片，只需要把 0 号分片的部分数据迁移给 3 号分片，1 号、2 号分片的数据完全不用动。
+
+```mermaid
+graph TD
+    subgraph 扩容为4分片哈希环
+        P0[0号分片]
+        P1[1号分片]
+        P2[2号分片]
+        P3[3号分片]
+
+        P0 -- 部分区间迁移 --> P3
+        P0 -- 剩余区间 --> P1
+        P1 -- 区间不变 --> P2
+        P2 -- 区间不变 --> P3
+        P3 -- 顺时针区间 --> P0
+    end
+```
+
+#### 优缺点
+- **优点**：大幅降低了扩容时的数据搬运量，提升了扩容操作的效率。
+- **缺点**：节点数量较少时，**数据分配容易不均匀，出现数据倾斜。**
+
+
+
+### 3) 哈希槽算法（Redis 采用）
+
+为了解决数据分配不均的问题，Redis Cluster 引入了 **哈希槽（Hash Slots）** 算法。
+
+#### 原理
+Redis 集群总共预设了 **16384 个哈希槽**，编号范围 `0 ~ 16383`。每一个key对应的槽位是固定的，每个 key 通过 CRC16 算法计算出哈希值，再对 16384 取余，得到对应的槽位：
+```plain
+hash_slot = crc16(key) % 16384
+```
+
+集群中的每个主节点负责管理一部分哈希槽，key 落在哪个槽，就由负责该槽的节点处理。**每个分片的节点使用位图来记录自己持有哪些槽位。**
+
+**分配示例**：
+- 0 号主节点：负责 `[0, 5461]`，共 5462 个槽位
+- 1 号主节点：负责 `[5462, 10922]`，共 5461 个槽位
+- 2 号主节点：负责 `[10923, 16383]`，共 5461 个槽位
+
+#### 扩容特性
+扩容时只需要从原有节点中迁移部分槽位到新节点即可，不需要重新计算所有 key 的映射。比如新增 3 号节点，只需要从每个原有节点各挪一部分槽位给新节点。
+
+```plain
+Master0 → 一部分槽位
+Master1 → 一部分槽位
+Master2 → 一部分槽位
+                 ↓
+             Master3
+```
+
+**为什么是 16384 个槽位？**
+
+- 正常 Redis 集群节点数不会超过 1000 个，16384 个槽位足够均匀分配。
+- 16384 个槽位的位图（bitmap）只占 2KB 左右，节点间同步状态时传输开销很小。
+- 槽位数量过多会提升同步成本，16k 是性能和容量的均衡值。
+
+
+
+## 搭建（基于 docker）
+
+### 搭建规划
+本次共创建 11 个 Redis 节点容器：
+- 前 9 个节点搭建基础集群（3 主 6 从，每个主节点配 2 个从节点）
+- 后 2 个节点用于后续演示集群扩容
+
+#### 第一步：创建目录和配置文件
+创建 `redis-cluster` 目录，目录内新建 `generate.sh` 脚本，批量生成 11 个节点的配置文件。
+
+`generate.sh` 内容：
+```bash
+# 生成前9个节点配置
+for port in $(seq 1 9); \
+do \
+mkdir -p redis${port}/; \
+touch redis${port}/redis.conf
+cat << EOF > redis${port}/redis.conf
+port 6379
+bind 0.0.0.0
+protected-mode no
+appendonly yes
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 5000
+cluster-announce-ip 172.30.0.10${port}
+cluster-announce-port 6379
+cluster-announce-bus-port 16379
+EOF
+done
+
+# 生成后2个扩容节点配置
+for port in $(seq 10 11); \
+do \
+mkdir -p redis${port}/; \
+touch redis${port}/redis.conf
+cat << EOF > redis${port}/redis.conf
+port 6379
+bind 0.0.0.0
+protected-mode no
+appendonly yes
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 5000
+cluster-announce-ip 172.30.0.1${port}
+cluster-announce-port 6379
+cluster-announce-bus-port 16379
+EOF
+done
+```
+这个脚本就是：
+
+* **一次性创建 11 个 Redis 节点的目录和配置文件。**
+* **前 9 个节点用于搭建初始 Redis Cluster，后 2 个作为后续扩容节点。**
+* 每个节点都开启 **Cluster 模式、AOF 持久化**，并配置自己的集群通信 IP 和端口。
+* **这里只是在准备节点配置，还没有真正创建集群或分配 Master/Slave。**
+
+
+执行脚本生成配置：
+```bash
+bash generate.sh
+```
+
+生成的目录结构：
+```
+redis-cluster/
+├── docker-compose.yml
+├── generate.sh
+├── redis1/
+│   └── redis.conf
+├── redis2/
+│   └── redis.conf
+...
+└── redis11/
+    └── redis.conf
+```
+
+#### 配置项说明
+- `cluster-enabled yes`：开启 Redis 集群模式
+- `cluster-config-file nodes.conf`：集群节点信息自动生成的配置文件
+- `cluster-node-timeout 5000`：节点心跳失联的超时时间，单位毫秒
+- `cluster-announce-ip`：节点对外宣告的自身 IP，供其他节点访问
+- `cluster-announce-port`：节点业务数据端口
+- `cluster-announce-bus-port`：节点集群总线端口，用于节点间管理通信
+
+
+
+#### 第二步：编写 docker-compose.yml
+创建自定义网段 `172.30.0.0/24`，配置 11 个节点的容器、端口映射和固定 IP。
+
+```yaml
+version: '3.7'
+networks:
+  mynet:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24 # 创建 mynet 的 Docker 局域网
+services:
+  redis1:
+    # 使用 Redis 5.0.9 镜像
+    image: 'redis:5.0.9'
+    # 给容器指定固定名称，方便 docker exec、docker logs 等操作
+    container_name: redis1
+    # 容器异常退出或 Docker 重启后，自动重新启动
+    restart: always
+    # 挂载配置文件目录
+    # 宿主机 ./redis1/  →  容器 /etc/redis/
+    volumes:
+      - ./redis1/:/etc/redis/
+
+    # 端口映射
+    # 宿主机端口 : 容器端口
+    ports:
+      # Redis 客户端访问端口
+      # 宿主机 6371 → redis1 容器的 6379
+      - 6371:6379
+      # Redis Cluster Bus 集群内部通信端口
+      # 宿主机 16371 → redis1 容器的 16379
+      - 16371:16379
+    # 启动 Redis，并指定使用 redis.conf 配置文件
+    command: redis-server /etc/redis/redis.conf
+
+    # 将 redis1 加入 mynet Docker 网络
+    networks:
+      mynet:
+        # 给 redis1 指定固定的 Docker 内网 IP
+        ipv4_address: 172.30.0.101
+  redis2:
+    image: 'redis:5.0.9'
+    container_name: redis2
+    restart: always
+    volumes:
+      - ./redis2/:/etc/redis/
+    ports:
+      - 6372:6379
+      - 16372:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.102
+  redis3:
+    image: 'redis:5.0.9'
+    container_name: redis3
+    restart: always
+    volumes:
+      - ./redis3/:/etc/redis/
+    ports:
+      - 6373:6379
+      - 16373:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.103
+  redis4:
+    image: 'redis:5.0.9'
+    container_name: redis4
+    restart: always
+    volumes:
+      - ./redis4/:/etc/redis/
+    ports:
+      - 6374:6379
+      - 16374:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.104
+  redis5:
+    image: 'redis:5.0.9'
+    container_name: redis5
+    restart: always
+    volumes:
+      - ./redis5/:/etc/redis/
+    ports:
+      - 6375:6379
+      - 16375:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.105
+  redis6:
+    image: 'redis:5.0.9'
+    container_name: redis6
+    restart: always
+    volumes:
+      - ./redis6/:/etc/redis/
+    ports:
+      - 6376:6379
+      - 16376:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.106
+  redis7:
+    image: 'redis:5.0.9'
+    container_name: redis7
+    restart: always
+    volumes:
+      - ./redis7/:/etc/redis/
+    ports:
+      - 6377:6379
+      - 16377:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.107
+  redis8:
+    image: 'redis:5.0.9'
+    container_name: redis8
+    restart: always
+    volumes:
+      - ./redis8/:/etc/redis/
+    ports:
+      - 6378:6379
+      - 16378:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.108
+  redis9:
+    image: 'redis:5.0.9'
+    container_name: redis9
+    restart: always
+    volumes:
+      - ./redis9/:/etc/redis/
+    ports:
+      - 6379:6379
+      - 16379:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.109
+  redis10:
+    image: 'redis:5.0.9'
+    container_name: redis10
+    restart: always
+    volumes:
+      - ./redis10/:/etc/redis/
+    ports:
+      - 6380:6379
+      - 16380:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.110
+  redis11:
+    image: 'redis:5.0.9'
+    container_name: redis11
+    restart: always
+    volumes:
+      - ./redis11/:/etc/redis/
+    ports:
+      - 6381:6379
+      - 16381:16379
+    command: redis-server /etc/redis/redis.conf
+    networks:
+      mynet:
+        ipv4_address: 172.30.0.111
+```
+
+
+
+#### 第三步：启动容器
+在 `redis-cluster` 目录下执行：
+```bash
+docker-compose up -d
+```
+
+
+
+#### 第四步：构建集群
+使用 `redis-cli` 执行集群创建命令，将前 9 个节点组建成 3 主 6 从的集群：
+
+```bash
+# 创建 Redis Cluster
+redis-cli --cluster create \
+
+# 加入 Redis Cluster 的节点
+172.30.0.101:6379 \
+172.30.0.102:6379 \
+172.30.0.103:6379 \
+172.30.0.104:6379 \
+172.30.0.105:6379 \
+172.30.0.106:6379 \
+172.30.0.107:6379 \
+172.30.0.108:6379 \
+172.30.0.109:6379 \
+
+# 每个主节点配置 2 个从节点
+# 9 个节点最终分配为：
+# 3 个 Master + 6 个 Replica
+--cluster-replicas 2
+```
+
+参数说明：
+- `--cluster create`：创建集群，后面依次列出所有节点地址
+- `--cluster-replicas 2`：每个主节点配置 2 个从节点
+
+```plain
+```text
+>>> Performing hash slots allocation on 9 nodes...
+# 在 9 个 Redis 节点中分配 Redis Cluster 的 16384 个 Hash Slot
+
+Master[0] -> Slots 0 - 5460
+# 第 1 个主节点负责 0~5460 号槽位，共 5461 个
+
+Master[1] -> Slots 5461 - 10922
+# 第 2 个主节点负责 5461~10922 号槽位，共 5462 个
+
+Master[2] -> Slots 10923 - 16383
+# 第 3 个主节点负责 10923~16383 号槽位，共 5461 个
+
+# 三个 Master 一共覆盖：
+# 5461 + 5462 + 5461 = 16384 个槽位
+
+
+Adding replica 172.30.0.105:6379 to 172.30.0.101:6379
+# redis5 作为 redis1 的 Replica（从节点）
+
+Adding replica 172.30.0.106:6379 to 172.30.0.101:6379
+# redis6 作为 redis1 的 Replica（从节点）
+
+
+Adding replica 172.30.0.107:6379 to 172.30.0.102:6379
+# redis7 作为 redis2 的 Replica（从节点）
+
+Adding replica 172.30.0.108:6379 to 172.30.0.102:6379
+# redis8 作为 redis2 的 Replica（从节点）
+
+
+Adding replica 172.30.0.109:6379 to 172.30.0.103:6379
+# redis9 作为 redis3 的 Replica（从节点）
+
+Adding replica 172.30.0.104:6379 to 172.30.0.103:6379
+# redis4 作为 redis3 的 Replica（从节点）
+
+
+M: 15f9572e7e81195a695f5507ca1b49eccf53b659 172.30.0.101:6379
+# M = Master，172.30.0.101 是主节点 redis1
+
+   slots:[0-5460] (5461 slots) master
+# redis1 负责 0~5460 号槽位
+
+
+M: b4c01a0a885600b87688bf1c74f4b031746e4d6b 172.30.0.102:6379
+# M = Master，172.30.0.102 是主节点 redis2
+
+   slots:[5461-10922] (5462 slots) master
+# redis2 负责 5461~10922 号槽位
+
+
+M: 7ac99970b4eed7b1e40b704f1127e4309b93098a 172.30.0.103:6379
+# M = Master，172.30.0.103 是主节点 redis3
+
+   slots:[10923-16383] (5461 slots) master
+# redis3 负责 10923~16383 号槽位
+
+
+S: e4cad376b31d415496773dc84d0a1fe11891c2ad 172.30.0.104:6379
+# S = Slave，172.30.0.104 是从节点 redis4
+
+   replicates 7ac99970b4eed7b1e40b704f1127e4309b93098a
+# redis4 复制的 Master 是 7ac999...，即 redis3
+
+
+S: eb89624804c1d5185ccaf1c133f8d7b7b54001fb 172.30.0.105:6379
+# S = Slave，172.30.0.105 是从节点 redis5
+
+   replicates 15f9572e7e81195a695f5507ca1b49eccf53b659
+# redis5 复制的 Master 是 15f957...，即 redis1
+
+
+S: b0b57cafbce8af451c5cd57b798d084af93e6cc9 172.30.0.106:6379
+# S = Slave，172.30.0.106 是从节点 redis6
+
+   replicates 15f9572e7e81195a695f5507ca1b49eccf53b659
+# redis6 复制的 Master 是 15f957...，即 redis1
+
+
+S: f32a32b2b77d4d86f8d9e173cc1131950c4be1d2 172.30.0.107:6379
+# S = Slave，172.30.0.107 是从节点 redis7
+
+   replicates b4c01a0a885600b87688bf1c74f4b031746e4d6b
+# redis7 复制的 Master 是 b4c01...，即 redis2
+
+
+S: f715129df8d8808f3130b2ab58e98b524650dd62 172.30.0.108:6379
+# S = Slave，172.30.0.108 是从节点 redis8
+
+   replicates b4c01a0a885600b87688bf1c74f4b031746e4d6b
+# redis8 复制的 Master 是 b4c01...，即 redis2
+
+
+S: 0c04db5e9ced335a29cbe0887457b2bc90e7ac8c 172.30.0.109:6379
+# S = Slave，172.30.0.109 是从节点 redis9
+
+   replicates 7ac99970b4eed7b1e40b704f1127e4309b93098a
+# redis9 复制的 Master 是 7ac999...，即 redis3
+
+
+Can I set the above configuration? (type 'yes' to accept): yes
+# Redis CLI 把上面的主从关系和 Slot 分配结果展示出来
+# 输入 yes 后，正式应用这套 Cluster 配置
+
+
+>>> Nodes configuration updated
+# 各个 Redis 节点的 Cluster 配置已经更新
+
+
+>>> Assign a different config epoch to each node
+# 给节点分配不同的 config epoch（集群配置版本号）
+
+
+>>> Sending CLUSTER MEET messages to join the cluster
+# 向各个 Redis 节点发送 CLUSTER MEET
+# 让这些节点互相认识，并加入同一个 Redis Cluster
+
+
+Waiting for the cluster to join
+# 等待所有节点完成加入和节点信息交换
+
+....
+# 等待过程中，节点之间正在建立集群关系
+
+
+>>> Performing Cluster Check (using node 172.30.0.101:6379)
+# 以 redis1（172.30.0.101）为入口，检查整个 Cluster
+
+
+M: 15f9572e7e81195a695f5507ca1b49eccf53b659 172.30.0.101:6379
+   slots:[0-5460] (5461 slots) master
+   2 additional replica(s)
+# redis1 是 Master
+# 负责 0~5460 号槽位
+# 并且有 2 个 Replica：redis5、redis6
+
+
+S: 0c04db5e9ced335a29cbe0887457b2bc90e7ac8c 172.30.0.109:6379
+   slots: (0 slots) slave
+   replicates 7ac99970b4eed7b1e40b704f1127e4309b93098a
+# redis9 是 Slave
+# 从节点本身不负责 Slot，所以显示 0 slots
+# 它复制 redis3
+
+
+S: e4cad376b31d415496773dc84d0a1fe11891c2ad 172.30.0.104:6379
+   slots: (0 slots) slave
+   replicates 7ac99970b4eed7b1e40b704f1127e4309b93098a
+# redis4 是 Slave
+# 它复制 redis3
+
+
+S: f32a32b2b77d4d86f8d9e173cc1131950c4be1d2 172.30.0.107:6379
+   slots: (0 slots) slave
+   replicates b4c01a0a885600b87688bf1c74f4b031746e4d6b
+# redis7 是 Slave
+# 它复制 redis2
+
+
+S: eb89624804c1d5185ccaf1c133f8d7b7b54001fb 172.30.0.105:6379
+   slots: (0 slots) slave
+   replicates 15f9572e7e81195a695f5507ca1b49eccf53b659
+# redis5 是 Slave
+# 它复制 redis1
+
+
+S: f715129df8d8808f3130b2ab58e98b524650dd62 172.30.0.108:6379
+   slots: (0 slots) slave
+   replicates b4c01a0a885600b87688bf1c74f4b031746e4d6b
+# redis8 是 Slave
+# 它复制 redis2
+
+
+S: b0b57cafbce8af451c5cd57b798d084af93e6cc9 172.30.0.106:6379
+   slots: (0 slots) slave
+   replicates 15f9572e7e81195a695f5507ca1b49eccf53b659
+# redis6 是 Slave
+# 它复制 redis1
+
+
+M: b4c01a0a885600b87688bf1c74f4b031746e4d6b 172.30.0.102:6379
+   slots:[5461-10922] (5462 slots) master
+   2 additional replica(s)
+# redis2 是 Master
+# 负责 5461~10922 号槽位
+# 并且有 2 个 Replica：redis7、redis8
+
+
+M: 7ac99970b4eed7b1e40b704f1127e4309b93098a 172.30.0.103:6379
+   slots:[10923-16383] (5461 slots) master
+   2 additional replica(s)
+# redis3 是 Master
+# 负责 10923~16383 号槽位
+# 并且有 2 个 Replica：redis9、redis4
+
+
+[OK] All nodes agree about slots configuration.
+# 所有节点对 Slot 的分配结果一致
+# 都认为：
+# redis1 → 0~5460
+# redis2 → 5461~10922
+# redis3 → 10923~16383
+
+
+>>> Check for open slots...
+# 检查是否存在没有正确分配给 Master 的 Slot
+
+
+>>> Check slots coverage...
+# 检查 16384 个 Slot 是否全部被覆盖
+
+
+[OK] All 16384 slots covered.
+# 16384 个 Slot 全部已经被 3 个 Master 覆盖
+# 表示 Cluster 的 Slot 分配完整，集群创建成功
+```
+执行后命令行会输出哈希槽分配方案、主从对应关系，输入 `yes` 确认配置。
+当看到输出 `[OK] All 16384 slots covered` 时，代表集群搭建完成。
+
+#### 客户端连接
+连接集群时需要加上 `-c` 参数，用于开启集群模式，让 `redis-cli` 遇到 `MOVED` 重定向时自动跳转到正确的 Redis 节点。
+
+```bash
+redis-cli -h 172.30.0.101 -p 6379 -c
+
+172.30.0.101:6379> set key 123456
+-> Redirected to slot [12539] located at 172.30.0.103:6379
+OK
+```
+
+`key` 计算得到 **12539 槽位**，该槽位由 `172.30.0.103:6379` 负责，所以 `-c` 自动将请求重定向过去执行。
+
+> 对于一个命令涉及到多个key的情况，会出现一些错误。因为 Redis Cluster 要求**同一次涉及多个 Key 的操作必须让这些 Key 属于同一个 Slot**，否则会报 `CROSSSLOT`，无法重定向到一个节点统一执行。
+
+
+查看集群节点状态：
+```bash
+172.30.0.103:6379> CLUSTER nodes
+15f9572e7e81195a695f5507ca1b49eccf53b659 172.30.0.101:6379@16379 master - 0 1788016749000 1 connected 0-5460
+e4cad376b31d415496773dc84d0a1fe11891c2ad 172.30.0.104:6379@16379 slave 7ac99970b4eed7b1e40b704f1127e4309b93098a 0 1788016750946 4 connected
+f32a32b2b77d4d86f8d9e173cc1131950c4be1d2 172.30.0.107:6379@16379 slave b4c01a0a885600b87688bf1c74f4b031746e4d6b 0 1788016749000 7 connected
+b0b57cafbce8af451c5cd57b798d084af93e6cc9 172.30.0.106:6379@16379 slave 15f9572e7e81195a695f5507ca1b49eccf53b659 0 1788016750536 6 connected
+7ac99970b4eed7b1e40b704f1127e4309b93098a 172.30.0.103:6379@16379 myself,master - 0 1788016749000 3 connected 10923-16383
+f715129df8d8808f3130b2ab58e98b524650dd62 172.30.0.108:6379@16379 slave b4c01a0a885600b87688bf1c74f4b031746e4d6b 0 1788016749512 8 connected
+eb89624804c1d5185ccaf1c133f8d7b7b54001fb 172.30.0.105:6379@16379 slave 15f9572e7e81195a695f5507ca1b49eccf53b659 0 1788016750000 5 connected
+0c04db5e9ced335a29cbe0887457b2bc90e7ac8c 172.30.0.109:6379@16379 slave 7ac99970b4eed7b1e40b704f1127e4309b93098a 0 1788016749921 9 connected
+b4c01a0a885600b87688bf1c74f4b031746e4d6b 172.30.0.102:6379@16379 master - 0 1788016749512 2 connected 5461-10922
+```
+
+
+
+### 主节点宕机与故障转移
+
+#### 演示效果
+手动停止一个主节点，观察集群自动故障转移：
+
+1. 停止主节点 redis1：
+```bash
+docker stop redis1
+```
+
+2. 连接其他节点查看集群状态，会发现 redis1 节点被标记为 `fail`，它的其中一个从节点会自动晋升为新的主节点，接管所有槽位。
+
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/f1de4725d6e64db48c8955afa11d8a9f.png)
+
+
+3. 重新启动 redis1：
+```bash
+docker start redis1
+```
+
+4. 再次查看状态，原主节点重启后会自动降级为从节点，同步新主节点的数据。
+
+也可以手动执行 `CLUSTER FAILOVER` 进行主从切换，将原主节点重新恢复为主角色。
+
+
+#### 故障处理流程
+
+#### 1) 故障判定
+
+集群中的所有节点，都会周期性的使用心跳包进行通信。
+
+1. 节点A给节点B发送ping包，B就会给A返回一个pong包。ping和pong除了 **message type** 属性之外，其他部分都是一样的。这里包含了集群的配置信息(该节点的id，该节点从属于哪个分片，是主节点还是从节点，都属于谁，持槽有哪些slots的位置…)。
+2. 每个节点每秒钟，都会给一些随机的节点发起ping包，而不是全发一遍。这样设定是为了避免在节点很多的时候，心跳包也非常多
+3. 当节点A给节点B发起ping包，B不能如期回应的时候，此时A就会尝试重置和B的tcp连接，看能否连接成功。如果仍然连接失败，A就会把B设为 **PFAIL** 状态 **(主观下线)**。
+   - A判定B为 **PFALL** 之后，会通过redis 内部的Gossip协议，和其他节点进行沟通，向其他节点确认B的状态。
+4. 此时A发现其他很多节点，也认为B为 **PFALL**，并且数目超过总集群个数的一半，那么A就会把B标记成 **FAIL** **(客观下线)**，并且把这个消息同步给其他节点(其他节点收到之后，也会把B标记成FAIL)。
+
+
+
+有的时候会引起整个集群都宕机(称为 fail 状态)。以下三种情况会出现集群宕机：
+
+- 某个分片，所有的主节点和从节点都挂了。
+- 某个分片，主节点挂了，但是没有从节点。
+- 超过半数的master节点都挂了。
+
+
+
+#### 故障判定流程
+
+```mermaid
+flowchart TD
+    A[节点A向节点B发送ping心跳包] --> B{节点B正常返回pong?}
+    B -->|是| C[维持正常通信状态]
+    B -->|否| D[重置TCP连接重试通信]
+    D --> E{重试连接成功?}
+    E -->|是| C
+    E -->|否| F[节点A将B标记为PFAIL<br>主观下线]
+    F --> G[通过Gossip协议同步状态<br>询问其他节点对B的判定]
+    G --> H{认为B下线的主节点<br>数量超过集群半数?}
+    H -->|否| I[维持PFAIL主观下线状态]
+    H -->|是| J[将B标记为FAIL<br>客观下线]
+    J --> K[广播FAIL消息给集群全部节点]
+```
+
+#### 2) 故障迁移
+
+上述例子中，B故障，并且A把B FAIL的消息告知集群中的其他节点。
+
+- **如果B是从节点，那么不需要进行故障迁移。**
+- **如果B是主节点，那么就会由B的从节点(比如C和D)触发故障迁移了。**
+
+故障迁移把从节点提拔成主节点，继续给整个redis集群提供支持：
+
+1. **参选资格**：从节点与主节点长时间失联，超过阈值就失去参选资格。
+2. **等待竞选**：有资格的从节点随机等待，**复制偏移量越大，等待越短，越优先参选**。
+3. **拉票**：等待结束后向其他节点发起投票请求，**只有其他正常的主节点有投票权**。
+4. **当选主节点**：获得**超过半数主节点的票**后，当选并执行 `SLAVEOF NO ONE`，其他从节点重新复制它。
+5. **同步信息**：新主节点通知其他节点，**更新集群拓扑信息**。
+
+
+> Redis Cluster 的故障转移选举采用类似 **Raft** 的机制，等待时间最短的从节点优先发起选举并更容易当选。
+
+#### 故障迁移流程
+
+```mermaid
+flowchart TD
+    A[主节点B被标记为FAIL故障] --> B{故障节点角色？}
+    B -->|从节点| C[无需执行故障迁移]
+    B -->|主节点| D[从节点检查参选资格<br>校验与主节点失联时长]
+    D --> E{具备参选资格?}
+    E -->|否| F[放弃本轮竞选]
+    E -->|是| G[进入随机休眠倒计时]
+    G --> H[休眠结束，向所有主节点发起拉票]
+    H --> I{得票数超过主节点总数的一半?}
+    I -->|否| J[等待下一轮选举周期]
+    I -->|是| K[晋升为新主节点<br>执行 slaveof no one]
+    K --> L[通知其他从节点指向新主节点]
+    L --> M[同步新集群拓扑给所有节点]
+```
+
+## 集群扩容
+
+
+### 集群扩容整体流程
+
+```mermaid
+flowchart TD
+    A[启动扩容流程] --> B[添加新主节点进入集群<br>cluster add-node]
+    B --> C[新节点成为无slot的空主节点]
+    C --> D[执行 reshard 重新分片<br>迁移slot到新主节点]
+    D --> E[slot与对应数据迁移完成]
+    E --> F[为新主节点挂载从节点<br>add-node --cluster-slave]
+    F --> G[集群扩容完成]
+```
+
+#### 第一步: 把新的主节点加入到集群
+
+上面已经把redis1~redis9重新构成了集群，**接下来把redis10和redis11也加入集群。这里把redis10作为主机，redis11作为从机。**
+
+```bash
+drw@192 ~ % docker exec redis2 redis-cli --cluster add-node 172.30.0.110:6379 172.30.0.101:6379
+>>> Adding node 172.30.0.110:6379 to cluster 172.30.0.101:6379
+>>> Performing Cluster Check (using node 172.30.0.101:6379)
+S: 15f9572e7e81195a695f5507ca1b49eccf53b659 172.30.0.101:6379
+   slots: (0 slots) slave
+   replicates eb89624804c1d5185ccaf1c133f8d7b7b54001fb
+M: eb89624804c1d5185ccaf1c133f8d7b7b54001fb 172.30.0.105:6379
+   slots:[0-5460] (5461 slots) master
+   2 additional replica(s)
+S: 0c04db5e9ced335a29cbe0887457b2bc90e7ac8c 172.30.0.109:6379
+   slots: (0 slots) slave
+   replicates 7ac99970b4eed7b1e40b704f1127e4309b93098a
+M: b4c01a0a885600b87688bf1c74f4b031746e4d6b 172.30.0.102:6379
+   slots:[5461-10922] (5462 slots) master
+   2 additional replica(s)
+M: 7ac99970b4eed7b1e40b704f1127e4309b93098a 172.30.0.103:6379
+   slots:[10923-16383] (5461 slots) master
+   2 additional replica(s)
+S: e4cad376b31d415496773dc84d0a1fe11891c2ad 172.30.0.104:6379
+   slots: (0 slots) slave
+   replicates 7ac99970b4eed7b1e40b704f1127e4309b93098a
+S: f715129df8d8808f3130b2ab58e98b524650dd62 172.30.0.108:6379
+   slots: (0 slots) slave
+   replicates b4c01a0a885600b87688bf1c74f4b031746e4d6b
+S: b0b57cafbce8af451c5cd57b798d084af93e6cc9 172.30.0.106:6379
+   slots: (0 slots) slave
+   replicates eb89624804c1d5185ccaf1c133f8d7b7b54001fb
+S: f32a32b2b77d4d86f8d9e173cc1131950c4be1d2 172.30.0.107:6379
+   slots: (0 slots) slave
+   replicates b4c01a0a885600b87688bf1c74f4b031746e4d6b
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+>>> Send CLUSTER MEET to node 172.30.0.110:6379 to make it join the cluster.
+[OK] New node added correctly.
+```
+
+> 172.30.0.110 加入了 以 172.30.0.101:6379 作为集群入口节点
+
+
+
+#### 第二步: 重新分配 slots
+
+**对 Redis Cluster 重新分配 Hash Slot，把原来 Master 的一部分 Slot 和数据迁移给新节点。**
+
+```bash
+redis-cli --cluster reshard 172.30.0.101:6379
+```
+
+
+* `reshard`：执行重新分片
+* `172.30.0.101:6379`：作为操作入口，**可以是集群中的任意节点**
+
+
+执行之后，会进入交互式操作，redis会提示用户输入以下内容：
+
+- How many slots do you want to move (from 1 to 16384)? **填写你想从原有 Master 迁移给新 Master 的 Slot 数量。**
+- What is the receiving node ID? **接收 Slot 的节点 ID**
+- Please enter all the source node IDs.
+  Type 'all' to use all the nodes as source nodes for the hash slots.
+  Type 'done' once you entered all the source nodes IDs.**选择所有的master都拿过来点或从指定的master复制。**
+
+
+> **Redis Cluster 在 Reshard 过程中存在短暂的数据迁移不一致和访问重定向问题**：正在迁移的 Slot 访问可能遇到 `MOVED/ASK` 等重定向，而未迁移的 Slot 不受影响；迁移完成后恢复正常。睡哦人话就是用户访问某个 `key` 时，如果它所在的 Slot **正在迁移**，请求可能暂时被重定向或访问异常；如果 Slot **没有迁移**，访问正常。
+
+
+
+#### 第三步: 给新的主节点添加从节点
+
+还需要给新添加到集群的主节点搭配相应的，**把 `172.30.0.111` 加入集群，并指定它作为 `172.30.0.110` 的从节点。**
+
+```bash
+redis-cli --cluster add-node 172.30.0.111:6379 172.30.0.101:6379 \
+--cluster-slave \
+--cluster-master-id [172.30.0.110 的 nodeId]
+```
+
+参数含义：
+
+* `add-node`：向集群添加一个新节点
+* `172.30.0.111:6379`：**要加入的新节点**
+* `172.30.0.101:6379`：**集群中任意一个已有节点**，作为联系集群的入口
+* `--cluster-slave`：指定新节点作为 **Replica（从节点）**
+* `--cluster-master-id`：指定这个 Replica **跟随哪个 Master**
+* `[172.30.0.110 的 nodeId]`：填写新 Master `172.30.0.110` 的 **Node ID**
+
+
+## 集群缩容
+
+
+### 集群缩容整体流程
+
+```mermaid
+flowchart TD
+    A[启动缩容流程] --> B[删除待下线主节点对应的从节点<br>cluster del-node]
+    B --> C[分批执行 reshard<br>迁移待下线节点的所有slot]
+    C --> D[待下线节点不再持有任何slot]
+    D --> E[删除待下线的主节点<br>cluster del-node]
+    E --> F[集群缩容完成]
+```
+具体的操作步骤就省略了，因为使用场景较少，嗯就这样。
+
+
+
+# 缓存
+## 什么是缓存
+缓存的核心思想是：**将频繁访问的数据存放在访问速度更快、距离更近的地方**，从而减少数据获取的时间，提高系统整体性能。由于访问速度越快的存储介质通常容量越小、成本越高，因此缓存空间有限，通常只保存访问频繁的**热点数据**，以较小的存储成本换取较大的性能提升。
+
+
+## 使用 Redis 作为缓存
+传统Mysql存储数据性能不高，进行一次查询操作消耗的系统资源较多。
+
+> 为什么说关系型数据库性能不高？
+>
+> 1. 数据库存储在硬盘上，硬盘尤其是随机 IO 的速度较慢。
+> 2. 查询无法命中索引时，需要遍历数据，会增加 IO 次数。
+> 3. SQL 执行需要进行解析、校验和优化。
+> 4. 复杂查询（如联合查询）涉及更多计算，效率更低。
+> 5. ……
+
+因此，当访问数据库的并发量较高时，数据库的 CPU、内存、IO、网络等资源会快速消耗，容易达到性能瓶颈甚至宕机。
+
+
+如何让数据库能够承担更大的并发量呢？核心思路主要是两个：
+
+* **开源**：增加数据库实例，构建数据库集群。（主从复制、分库分表等……）
+* **节流**：引入缓存，保存热点数据，减少直接访问数据库的请求。
+
+实际开发中，这两种方案通常会结合使用。
+
+Redis 就是常见的数据库缓存方案。
+
+> Redis 访问速度通常比 MySQL 更快。
+>
+> * Redis 数据存储在内存中，访问速度比硬盘快。
+> * Redis 主要提供简单的 key-value 操作，不需要处理复杂 SQL 查询。
+
+因此，Redis 可以作为 MySQL 前面的“护盾”，减少数据库压力，提高系统的并发处理能力。
+
+
+```mermaid
+flowchart LR
+    subgraph 客户端集群
+        C1[客户端]
+        C2[客户端]
+        C3[客户端]
+    end
+    C1 --> 业务服务器
+    C2 --> 业务服务器
+    C3 --> 业务服务器
+    业务服务器 --> Redis[Redis 缓存]
+    业务服务器 --> MySQL[MySQL 数据库]
+```
+
+查询流程：
+- 客户端访问业务服务器，发起查询请求。
+- 业务服务器先查询 Redis，看想要的数据是否在 Redis 中存在。
+  - 如果在 Redis 中存在了，就直接返回，此时不必访问 MySQL 了。
+  - 如果在 Redis 中不存在，再查询 MySQL。
+
+按照“二八定律”，缓存少量热点数据，就能覆盖大部分读请求，从而减少数据库访问、提高性能。具体比例会因业务而异，但缓存通常能有效降低数据库压力。
+
+> **注意！**
+> 缓存主要用于提升**读操作**性能；写操作通常仍需写入数据库，缓存本身不能直接提升写性能。
+
+
+
+## 缓存的更新策略
+
+接下来一个重要问题是：**哪些数据属于热点数据？**
+
+### 1) 定期生成
+
+每隔一段时间（如一天、一周、一个月），统计数据的访问频次，选出访问量最高的前 N% 作为热点数据。
+
+> 以搜索引擎为例：通过日志记录用户的搜索词，定期统计搜索频次，得到“高频词表”并缓存。
+
+这种方式实现简单，但**实时性较低**，不适合应对突发热点。例如春节期间，“春晚”的访问量会突然大幅增加。
+
+### 2) 实时生成
+
+先通过 Redis 的 `maxmemory` 设置缓存容量上限。用户查询时：
+
+* **Redis 命中**：直接返回。
+* **Redis 未命中**：查询数据库，并将结果写入 Redis。
+
+当缓存达到 `maxmemory` 限制时，触发**缓存淘汰策略**，淘汰不够热门的数据。持续运行后，Redis 中会自然保留访问频繁的热点数据。通用的淘汰策略主要有以下几种：
+
+
+* **FIFO (First In First Out)**：淘汰最早进入缓存的数据。
+* **LRU (Least Recently Used)**：淘汰最近最久未使用的数据。
+* **LFU (Least Frequently Used)**：淘汰访问次数最少的数据。
+* **Random**：随机淘汰数据。
+
+
+Redis 内置的淘汰策略如下：
+
+* `volatile-lru`：内存不足时，从**设置了过期时间的 key** 中使用 LRU 淘汰。
+* `allkeys-lru`：内存不足时，从**所有 key** 中使用 LRU 淘汰。
+* `volatile-lfu`：Redis 4.0 新增；内存不足时，从**设置了过期时间的 key** 中使用 LFU 淘汰。
+* `allkeys-lfu`：Redis 4.0 新增；内存不足时，从**所有 key** 中使用 LFU 淘汰。
+* `volatile-random`：内存不足时，从**设置了过期时间的 key** 中随机淘汰。
+* `allkeys-random`：内存不足时，从**所有 key** 中随机淘汰。
+* `volatile-ttl`：内存不足时，从**设置了过期时间的 key** 中优先淘汰剩余 TTL 最短的 key。
+* `noeviction`：默认策略；内存不足时**不淘汰数据，新写入操作直接报错**。
+
+整体来看，Redis 的淘汰策略主要分为两类：
+
+* **volatile-***：只处理设置了过期时间的 key。
+* **allkeys-***：处理所有 key。
+
+再结合 `lru`、`lfu`、`random`、`ttl` 等具体策略决定**淘汰谁**。
+
+
+## 缓存预热, 缓存穿透, 缓存雪崩 和 缓存击穿
+
+### 关于缓存预热 (Cache preheating)
+
+#### 什么是缓存预热
+
+Redis 作为 MySQL 缓存时，刚启动或大量 key 同时失效后，缓存基本为空，大量请求会直接访问 MySQL，造成较大压力。
+
+因此需要提前将**热点数据写入 Redis**，让缓存尽快发挥保护 MySQL 的作用。
+
+热点数据可通过访问统计得到，不要求完全准确，只要能覆盖大部分请求即可；随着运行，缓存会根据实际访问情况逐渐调整。
+
+---
+
+### 关于缓存穿透 (Cache penetration)
+
+#### 什么是缓存穿透？
+
+请求的 key 在 **Redis 和数据库中都不存在**，因此不会被缓存，后续请求仍会反复查询数据库，导致数据库压力增大。
+
+#### 为何产生？
+
+* **业务设计不合理**：缺少参数合法性校验，非法 key 被直接查询。
+* **误操作**：数据库中的部分数据被误删。
+* **恶意攻击**：攻击者大量请求不存在的 key。
+
+#### 如何解决？
+
+* **参数校验**：查询前验证 key 的合法性。
+* **缓存空值**：数据库中不存在的 key 也写入 Redis，例如设置为 `""`，避免重复查询数据库。
+* **布隆过滤器**：查询前判断 key 是否可能存在，不存在则直接返回。
+
+
+---
+
+### 关于缓存雪崩 (Cache avalanche)
+
+#### 什么是缓存雪崩？
+
+**短时间内大量 key 同时失效**，导致大量请求直接访问数据库，使数据库压力骤增，甚至宕机。
+
+#### 为何产生？
+
+主要有两种情况：
+
+* **Redis 整体故障**。
+* **大量 key 同时过期**。
+
+大量 key 同时过期，常见原因是短时间写入大量 key，并设置了相同的过期时间。
+
+#### 如何解决？
+
+* **部署高可用 Redis 集群**，并完善监控和报警。
+* **避免 key 同时过期**：不设置过期时间，或在过期时间中加入随机时间因子。
+
+---
+
+### 关于缓存击穿 (Cache breakdown)
+
+#### 什么是缓存击穿？
+
+缓存雪崩的**特殊情况**：某个**热点 key 突然过期**，大量并发请求同时访问数据库，可能导致数据库压力骤增甚至宕机。
+
+#### 如何解决？
+
+* **热点 key 永不过期**：通过统计发现热点 key 后，不设置过期时间。
+* **服务降级**：例如访问数据库时使用**分布式锁**，限制同时访问数据库的并发请求数。
+
+# 分布式锁
+
+## 什么是分布式锁?
+
+
+
+在分布式系统中，多个节点可能同时访问同一资源，需要使用**分布式锁**保证互斥。
+
+Java 的 `synchronized`、C++ 的 `std::mutex` 只能在**当前进程内**生效，无法解决跨进程、跨主机的并发问题。
+
+分布式锁本质上是通过一个**公共服务记录锁的状态**，常见实现有 **Redis、MySQL、ZooKeeper** 等。
+
+## 分布式锁的基础实现
+
+
+核心思路是通过一个**键值对记录锁的状态**。
+
+以买票为例：多个服务器都可能同时执行“查询余票 → 余票减 1”。如果不加锁，多个请求可能同时读到相同的余票并重复扣减，导致**超卖**，因此需要通过锁保证操作的互斥性。
+
+
+无分布式锁的架构：
+```mermaid
+flowchart LR
+    subgraph 买票服务器集群
+        S1[买票服务器1]
+        S2[买票服务器2]
+        S3[买票服务器3]
+    end
+    S1 --> MySQL[MySQL 数据库]
+    S2 --> MySQL
+    S3 --> MySQL
+```
+
+在上述架构中引入一个 Redis，作为分布式锁的管理器。引入 Redis 后的分布式锁架构：
+```mermaid
+flowchart LR
+    subgraph 买票服务器集群
+        S1[买票服务器1]
+        S2[买票服务器2]
+        S3[买票服务器3]
+    end
+    S1 --> Redis[Redis 锁管理器]
+    S2 --> Redis
+    S3 --> Redis
+    Redis --> MySQL[MySQL 数据库]
+```
+
+买票服务器操作数据库前，先在 Redis 中用**车次作为 key 加锁**：
+
+* `SETNX`：key 不存在则加锁成功，进入数据库操作；存在则加锁失败，等待或放弃。
+* 数据库操作完成后，删除 Redis 中的锁，释放资源。
+
+因此，Redis 的 `SETNX` 可以实现多个服务器之间的**互斥访问**。
+
+> **注意：仅使用 `SETNX + DEL` 还不完善，还存在锁误删等问题。**
+
+
+## 引入过期时间
+
+
+服务器加锁后如果宕机，无法执行 `DEL`，可能导致锁永久存在。解决方法是在加锁时同时设置**过期时间**，让锁自动释放。
+
+使用：
+
+```bash
+SET key value EX 10 NX
+```
+
+表示：**只有 key 不存在时加锁，并设置 10 秒后自动过期。**
+
+
+> **注意：不能使用 `SETNX + EXPIRE` 分开操作。即使放进事务，也无法保证两个操作都一定成功；如果 `SETNX` 成功而 `EXPIRE` 失败，锁仍可能无法自动释放。因此应使用一条 `SET EX NX` 命令原子完成加锁和设置过期时间。**
+
+
+## 引入校验 id
+
+
+
+
+Redis 中的锁可能被其他服务器误删，因此可以把设置的键值对的值，不再是简单的设为一个 1，而是设成服务器的编号吗，给锁绑定**持有者身份**。
+
+例如：
+
+```text
+"001": "服务器1"
+```
+
+服务器1加锁后，服务器2即使误执行删除操作，也应该先检查锁的 `value` 是否属于自己。**只有加锁的服务器才能释放该锁**，从而避免误删其他服务器持有的锁。
+
+
+逻辑用伪代码描述如下：
+```java
+String key = [要加锁的资源 id];
+String serverId = [服务器的编号];
+
+// 加锁，设置过期时间为 10s
+redis.set(key, serverId, "NX", "EX", "10s");
+
+// 执行各种业务逻辑，比如修改数据库数据。
+doSomeThing();
+
+// 解锁，删除 key。但是删除前要检验下 serverId 是否匹配。
+if (redis.get(key) == serverId) {
+    redis.del(key);
+}
+```
+
+**但是很明显，解锁逻辑是两步操作“get”和“del”，这样做并非是原子的。**
+
+服务器1的线程 A 执行 `GET`，确认锁是自己的；但在执行 `DEL` 前，锁可能已经过期，服务器2的线程 C 通过 `SET NX EX` **重新获得了这把锁**。此时线程 A 再执行 `DEL`，就会把 **服务器2刚获得的锁删除**。
+
+
+## 引入 lua
+
+
+> **Lua 是一种轻量级的脚本语言，Redis 支持将 Lua 脚本直接在服务器端执行。**
+>
+> 在 Redis 中，可以把多个操作写进一个 Lua 脚本中，例如“判断锁是否属于当前线程 + 删除锁”。
+>
+> **Redis 会将整个 Lua 脚本作为一个整体执行，中间不会被其他客户端的命令插队，从而保证多个操作的原子性。**
+>
+> 因此，Lua 可以解决分布式锁中“先判断、再删除”两个操作之间被其他客户端插队的问题。
+
+不用事务，是因为事务只能保证一组命令连续执行，**不能方便地根据查询结果执行条件逻辑；Lua 可以在 Redis 服务端完成“查询 → 判断 → 操作”的完整逻辑，并保证整个脚本原子执行。**
+
+
+使用 Lua 脚本完成上述解锁功能：
+```lua
+if redis.call('get',KEYS[1]) == ARGV[1] then
+    return redis.call('del',KEYS[1])
+else
+    return 0
+end;
+```
+
+上述代码可以编写成一个 `.lua` 后缀的文件，由 `redis-cli` 或者 `redis-plus-plus` 或者 `jedis` 等客户端加载，并发送给 Redis 服务器，由 Redis 服务器来执行这段逻辑。
+**一个 lua 脚本会被 Redis 服务器以原子的方式来执行。**
+
+
+
+## 引入 watch dog
+> **问题：固定过期时间无法彻底解决锁提前失效。**
+> 比如锁设置 10s，但任务执行超过 10s，锁就会提前失效；把时间设为 30s 甚至更长，也无法保证任务一定在过期前完成。而且过期时间过长时，如果持锁服务器宕机，其他服务器也要等待很久才能获取锁。
+>
+> **解决方案：Watch Dog（看门狗）动态续约。**
+> Watch Dog 本质上是**业务服务器上的一个独立线程**，不是 Redis 服务器中的线程。它会定期检查任务是否完成，并动态维护锁的过期时间。
+>
+>
+> 例如：
+>
+> * 加锁时设置过期时间 **10s**；
+> * Watch Dog 每 **3s** 检查一次；
+> * **任务已完成**：通过 Lua 脚本删除锁；
+> * **任务未完成**：将锁的过期时间重新设置为 **10s**，也就是续约。
+>
+> 这样既能避免任务执行时间过长导致锁提前失效，又能保证持锁服务器宕机后，Watch Dog 也随之停止，锁无法继续续约，最终自动过期，让其他服务器及时获取锁。
+
+
+## 引入 Redlock 算法
+实践中，Redis 一般以**集群方式**部署，至少采用主从架构，而不是单机部署。这样就可能出现一种比较极端的情况：
+
+> 服务器1 向 master 节点加锁。刚写入 key，master 就宕机了；此时 slave 还未来得及同步这个 key，随后 slave 被提升为新的 master。由于新的 master 中没有这个 key，服务器2 仍然可以成功加锁。此时，服务器1 的加锁操作就形同虚设了。
+
+为了解决这种问题，Redis 作者提出了 **Redlock 算法**。
+
+这里引入一组相互独立的 Redis master 节点。每个 master 后面可以配置若干 slave，用于故障转移。不同组之间存储的数据是一致的，它们之间是**备份关系，而不是数据分片关系**，这一点与 Redis Cluster 不同。
+
+加锁时，客户端会按照一定顺序，依次向多个 master 节点发送加锁请求，并为每次加锁设置一个**超时时间**，例如 50ms。如果某个节点执行 `SETNX` 超过 50ms 仍未成功，就认为本次加锁在该节点上失败。
+
+```mermaid
+flowchart TD
+    M1[Redis master1]
+    M2[Redis master2]
+    M3[Redis master3]
+    M4[Redis master4]
+    M5[Redis master5]
+
+    线程一 -->|获取锁30ms| M1
+    线程一 -->|获取锁40ms| M2
+    线程一 -.->|超时| M3
+    线程一 -->|获取锁40ms| M4
+    线程一 -.->|超时| M5
+```
+
+如果某个节点加锁失败，就立即继续尝试下一个节点。
+
+当**成功加锁的节点数超过总节点数的一半**时，才认为整体加锁成功。
+
+例如，上面一共有 5 个节点，其中 3 个加锁成功，2 个失败，此时就认为加锁成功。
+
+这样，即使部分 Redis 节点发生故障，也不会直接导致锁失效。
+
+> 那么，是否可能所有节点都同时出现上述“大冤种”情况呢？
+>
+> 理论上当然可能，但多个独立节点同时出现这种故障的概率较低，因此在工程实践中可以通过这种方式提高锁的可靠性。
+
+释放锁时，也需要尝试向**所有节点**发送解锁请求，即使某些节点之前加锁超时，也需要尝试解锁，尽量避免残留锁。
+
+Redlock 的核心思想就是：加锁不能只依赖一个 Redis 节点，而是同时向多个独立的 Redis master 节点加锁；只有成功获得超过半数节点的锁，才认为整体加锁成功。**
+
+这样即使少数节点出现故障，也不会影响锁的整体可靠性。
+
+
+
+
+
